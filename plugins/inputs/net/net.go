@@ -1,0 +1,141 @@
+package net
+
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
+	"github.com/influxdata/telegraf/plugins/inputs"
+	"github.com/influxdata/telegraf/plugins/inputs/system"
+)
+
+type NetIOStats struct {
+	filter filter.Filter
+	ps     system.PS
+
+	skipChecks          bool
+	IgnoreProtocolStats bool
+	Interfaces          []string
+}
+
+func (_ *NetIOStats) Description() string {
+	return "Read metrics about network interface usage"
+}
+
+var netSampleConfig = `
+  ## By default, telegraf gathers stats from any up interface (excluding loopback)
+  ## Setting interfaces will tell it to gather these explicit interfaces,
+  ## regardless of status.
+  ##
+  # interfaces = ["eth0"]
+  ##
+  ## On linux systems telegraf also collects protocol stats.
+  ## Setting ignore_protocol_stats to true will skip reporting of protocol metrics.
+  ##
+  # ignore_protocol_stats = false
+  ##
+`
+
+func (_ *NetIOStats) SampleConfig() string {
+	return netSampleConfig
+}
+
+func uint64Format(metric uint64) float64 {
+	metricStr := strconv.FormatUint(metric, 10)
+	metricFloat, _ := strconv.ParseFloat(metricStr,64)
+	return metricFloat
+}
+
+func (s *NetIOStats) Gather(acc telegraf.Accumulator) error {
+	netio, err := s.ps.NetIO()
+	if err != nil {
+		return fmt.Errorf("error getting net io info: %s", err)
+	}
+
+	if s.filter == nil {
+		if s.filter, err = filter.Compile(s.Interfaces); err != nil {
+			return fmt.Errorf("error compiling filter: %s", err)
+		}
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("error getting list of interfaces: %s", err)
+	}
+	interfacesByName := map[string]net.Interface{}
+	for _, iface := range interfaces {
+		interfacesByName[iface.Name] = iface
+	}
+
+	for _, io := range netio {
+		if len(s.Interfaces) != 0 {
+			var found bool
+
+			if s.filter.Match(io.Name) {
+				found = true
+			}
+
+			if !found {
+				continue
+			}
+		} else if !s.skipChecks {
+			iface, ok := interfacesByName[io.Name]
+			if !ok {
+				continue
+			}
+
+			if iface.Flags&net.FlagLoopback == net.FlagLoopback {
+				continue
+			}
+
+			if iface.Flags&net.FlagUp == 0 {
+				continue
+			}
+		}
+
+		tags := map[string]string{
+			"interface": io.Name,
+		}
+
+		fields := map[string]interface{}{
+			"bytes_sent":   uint64Format(io.BytesSent),
+			"bytes_recv":   uint64Format(io.BytesRecv),
+			"packets_sent": uint64Format(io.PacketsSent),
+			"packets_recv": uint64Format(io.PacketsRecv),
+			"err_in":       uint64Format(io.Errin),
+			"err_out":      uint64Format(io.Errout),
+			"drop_in":      uint64Format(io.Dropin),
+			"drop_out":     uint64Format(io.Dropout),
+		}
+		acc.AddCounter("net", fields, tags)
+	}
+
+	// Get system wide stats for different network protocols
+	// (ignore these stats if the call fails)
+	if !s.IgnoreProtocolStats {
+		netprotos, _ := s.ps.NetProto()
+		fields := make(map[string]interface{})
+		for _, proto := range netprotos {
+			for stat, value := range proto.Stats {
+				name := fmt.Sprintf("%s_%s", strings.ToLower(proto.Protocol),
+					strings.ToLower(stat))
+				fields[name] = float64(value)
+			}
+		}
+		tags := map[string]string{
+			"interface": "all",
+		}
+		acc.AddFields("net", fields, tags)
+	}
+
+	return nil
+}
+
+func init() {
+	inputs.Add("net", func() telegraf.Input {
+		return &NetIOStats{ps: system.NewSystemPS()}
+	})
+}
